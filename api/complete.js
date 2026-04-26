@@ -4,6 +4,12 @@ import {
   markQueueItemMapped, searchNodes
 } from './_db.js';
 
+const CORS = (res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+};
+
 const VALID_PAGE_TYPES = new Set([
   'homepage','docs_page','api_reference','article','category_index',
   'product_page','search_results','profile','repo','dataset','paper','filing','other'
@@ -13,92 +19,68 @@ const VALID_LINK_TYPES = new Set([
 ]);
 
 function validateResult(result) {
-  if (!result?.url || typeof result.url !== 'string') return 'result.url required';
-  if (!result.url.startsWith('http')) return 'result.url must be a full URL';
-  if (result.page_type && !VALID_PAGE_TYPES.has(result.page_type)) return 'invalid page_type';
-  if (!Array.isArray(result.outbound_links)) return 'outbound_links must be an array';
-  if (result.outbound_links.length > 100) return 'max 100 outbound_links';
-  for (const link of result.outbound_links) {
-    if (!link.target_url || !link.target_url.startsWith('http')) return 'each link needs a valid target_url';
-    if (link.link_type && !VALID_LINK_TYPES.has(link.link_type)) return 'invalid link_type';
+  if (!result || typeof result !== 'object') return 'result must be an object';
+  const { url, title, page_type, breadcrumb, outbound_links } = result;
+  if (!url || typeof url !== 'string') return 'url required';
+  try { new URL(url); } catch(e) { return 'url must be valid'; }
+  if (!title || typeof title !== 'string') return 'title required';
+  if (!VALID_PAGE_TYPES.has(page_type)) return 'page_type must be one of: ' + [...VALID_PAGE_TYPES].join(',');
+  if (!Array.isArray(breadcrumb)) return 'breadcrumb must be array';
+  if (!Array.isArray(outbound_links)) return 'outbound_links must be array';
+  for (const link of outbound_links) {
+    if (!link.url || !link.anchor_text) return 'each link needs url and anchor_text';
+    if (link.link_type && !VALID_LINK_TYPES.has(link.link_type)) return 'invalid link_type: ' + link.link_type;
+    try { new URL(link.url); } catch(e) { return 'invalid link url: ' + link.url; }
   }
   return null;
 }
 
 export default async function handler(req, res) {
+  CORS(res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { task_id, result } = req.body || {};
-  if (!task_id) return res.status(400).json({ error: 'task_id required' });
+  const { task_id, agent_id, result } = req.body || {};
+  if (!task_id || !agent_id || !result) {
+    return res.status(400).json({ error: 'task_id, agent_id, and result required' });
+  }
 
   const validationError = validateResult(result);
   if (validationError) return res.status(400).json({ error: validationError });
 
-  try {
-    const task = await getTask(task_id);
-    if (!task)                       return res.status(404).json({ error: 'task not found' });
-    if (task.status === 'expired')   return res.status(410).json({ error: 'task expired' });
-    if (task.status === 'completed') return res.status(409).json({ error: 'task already completed' });
+  const task = await getTask(task_id);
+  if (!task) return res.status(404).json({ error: 'task not found' });
+  if (task.agent_id !== agent_id) return res.status(403).json({ error: 'task not assigned to this agent' });
+  if (task.status !== 'pending') return res.status(409).json({ error: 'task already ' + task.status });
 
-    const domain = new URL(result.url).hostname;
-    const node = {
-      url:               result.url,
-      domain,
-      page_type:         result.page_type || 'other',
-      title:             result.title || null,
-      depth:             result.depth || null,
-      breadcrumb:        result.breadcrumb || [],
-      nav_position:      result.nav_position || 'unknown',
-      http_status:       result.http_status || 200,
-      sitemap_listed:    false,
-      contributor_count: 1,
-      trust_score:       0.1,
-    };
-    await upsertNodes([node]);
+  const { url, title, page_type, breadcrumb, outbound_links } = result;
+  const targetUrl = new URL(url);
+  const domain = targetUrl.hostname;
 
-    if (result.outbound_links?.length) {
-      const edges = result.outbound_links
-        .filter(l => l.target_url && l.target_url !== result.url)
-        .map(l => ({
-          source_url:         result.url,
-          target_url:         l.target_url,
-          link_type:          l.link_type || 'inline_link',
-          anchor_text:        l.anchor_text || null,
-          confirmed_by_count: 1,
-        }));
-      if (edges.length) await upsertEdges(edges);
-    }
+  await upsertNodes([{
+    url, domain, title, page_type,
+    breadcrumb: breadcrumb || [],
+    trust_score: 0.1
+  }]);
 
-    await markQueueItemMapped(result.url).catch(() => {});
-    await completeTask(task_id);
-
-    let answer;
-    if (task.state === 'mapped') {
-      answer = task.answer_data;
-    } else if (task.state === 'partial') {
-      const matches = await searchNodes(task.query_domain, task.query_text);
-      answer = matches[0] ?? {
-        url: result.url, title: result.title,
-        breadcrumb: result.breadcrumb || [], trust_score: 0.1,
-        page_type: result.page_type || 'other',
-        note: 'Best available match — coverage improving',
-      };
-    } else {
-      const navLinks = (result.outbound_links || [])
-        .filter(l => l.link_type === 'nav_link' || l.link_type === 'inline_link')
-        .slice(0, 5);
-      answer = {
-        url: result.url, title: result.title,
-        breadcrumb: result.breadcrumb || [], trust_score: 0.1,
-        page_type: result.page_type || 'homepage',
-        nav_links: navLinks,
-        note: 'Domain newly mapped — best starting point we have',
-      };
-    }
-
-    return res.status(200).json({ answer });
-  } catch (err) {
-    console.error('[/complete]', err);
-    return res.status(500).json({ error: 'Internal error', detail: err.message });
+  if (outbound_links.length > 0) {
+    const edges = outbound_links.map(link => ({
+      from_url: url,
+      to_url: link.url,
+      anchor_text: link.anchor_text,
+      link_type: link.link_type || 'inline_link'
+    }));
+    await upsertEdges(edges);
   }
+
+  await completeTask(task_id);
+  await markQueueItemMapped(task.queue_item_id);
+
+  const originalQuery = task.original_query;
+  const answer = await searchNodes(originalQuery.url || originalQuery.domain, originalQuery.path);
+
+  return res.status(200).json({
+    status: 'accepted',
+    answer: answer || { type: 'still_unmapped', message: 'result stored but original query remains unmapped' }
+  });
 }
