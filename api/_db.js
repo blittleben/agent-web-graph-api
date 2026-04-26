@@ -45,7 +45,6 @@ export async function upsertNodes(nodes) {
 }
 
 export async function upsertEdges(edges) {
-  // Map from_url/to_url (agent payload) to source_url/target_url (DB schema)
   const mapped = edges.map(e => ({
     source_url: e.from_url || e.source_url,
     target_url: e.to_url   || e.target_url,
@@ -113,13 +112,33 @@ export async function markQueueItemMapped(url) {
   });
 }
 
-export async function getStats() {
-  const [nodeStats, edgeCount, domainStats] = await Promise.all([
-    sbFetch('/nodes?select=domain,page_type&limit=10000'),
-    sbFetch('/edges?select=id&limit=1', { headers: { Prefer: 'count=exact' } }),
-    sbFetch('/nodes?select=domain&limit=10000'),
-  ]);
+// Seed a brand-new URL into the queue (ignores duplicates)
+export async function seedQueue(domain, url, priority = 80) {
+  return sbFetch('/mapping_queue', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=ignore-duplicates' },
+    body: JSON.stringify([{ url, domain, priority, mapped: false }]),
+  });
+}
 
+// Enqueue a batch of outbound URLs discovered during a crawl
+// Skips URLs already in the queue via ignore-duplicates
+export async function enqueueUrls(items) {
+  if (!items.length) return;
+  const rows = items.map(({ url, domain, priority }) => ({
+    url, domain,
+    priority: priority ?? 30,
+    mapped: false,
+  }));
+  return sbFetch('/mapping_queue', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=ignore-duplicates' },
+    body: JSON.stringify(rows),
+  });
+}
+
+export async function getStats() {
+  const nodeStats = await sbFetch('/nodes?select=domain,page_type&limit=10000');
   const totalNodes = nodeStats.length;
   const byDomain = {};
   const byPageType = {};
