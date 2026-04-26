@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/**/*.js": { "runtime": "nodejs18.x" }
+  },
+  "routes": [
+    { "src": "/query",    "dest": "/api/query.js"    },
+    { "src": "/complete", "dest": "/api/complete.js"  },
+    { "src": "/health",   "dest": "/api/health.js"    }
+  ]
+}
