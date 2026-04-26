@@ -1,7 +1,4 @@
 {
-  "functions": {
-    "api/**/*.js": { "runtime": "nodejs20.x" }
-  },
   "routes": [
     { "src": "/query",    "dest": "/api/query.js"    },
     { "src": "/complete", "dest": "/api/complete.js" },
