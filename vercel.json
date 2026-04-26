@@ -2,6 +2,7 @@
   "routes": [
     { "src": "/query",    "dest": "/api/query.js"    },
     { "src": "/complete", "dest": "/api/complete.js" },
-    { "src": "/health",   "dest": "/api/health.js"   }
+    { "src": "/health",   "dest": "/api/health.js"   },
+    { "src": "/stats",    "dest": "/api/stats.js"    }
   ]
 }
