@@ -1,7 +1,6 @@
 /**
  * _db.js — Supabase REST helper (no dependencies, uses native fetch)
  */
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
@@ -46,10 +45,17 @@ export async function upsertNodes(nodes) {
 }
 
 export async function upsertEdges(edges) {
+  // Map from_url/to_url (agent payload) to source_url/target_url (DB schema)
+  const mapped = edges.map(e => ({
+    source_url: e.from_url || e.source_url,
+    target_url: e.to_url   || e.target_url,
+    anchor_text: e.anchor_text,
+    link_type: e.link_type || 'inline_link',
+  }));
   return sbFetch('/edges', {
     method: 'POST',
     headers: { Prefer: 'resolution=merge-duplicates' },
-    body: JSON.stringify(edges),
+    body: JSON.stringify(mapped),
   });
 }
 
@@ -105,4 +111,33 @@ export async function markQueueItemMapped(url) {
     method: 'PATCH',
     body: JSON.stringify({ mapped: true }),
   });
+}
+
+export async function getStats() {
+  const [nodeStats, edgeCount, domainStats] = await Promise.all([
+    sbFetch('/nodes?select=domain,page_type&limit=10000'),
+    sbFetch('/edges?select=id&limit=1', { headers: { Prefer: 'count=exact' } }),
+    sbFetch('/nodes?select=domain&limit=10000'),
+  ]);
+
+  const totalNodes = nodeStats.length;
+  const byDomain = {};
+  const byPageType = {};
+
+  for (const row of nodeStats) {
+    byDomain[row.domain] = (byDomain[row.domain] || 0) + 1;
+    byPageType[row.page_type || 'other'] = (byPageType[row.page_type || 'other'] || 0) + 1;
+  }
+
+  const topDomains = Object.entries(byDomain)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([domain, count]) => ({ domain, pages: count }));
+
+  return {
+    nodes: totalNodes,
+    domains: Object.keys(byDomain).length,
+    by_page_type: byPageType,
+    top_domains: topDomains,
+  };
 }
