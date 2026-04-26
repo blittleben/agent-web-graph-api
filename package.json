@@ -1,0 +1,7 @@
+{
+  "name": "agent-web-graph-api",
+  "version": "1.0.0",
+  "description": "Navigation graph API for AI agents",
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
