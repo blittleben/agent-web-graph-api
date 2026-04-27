@@ -17,11 +17,12 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { domain, query } = req.body || {};
+  const { domain, query, agent_id } = req.body || {};
   if (!domain || !query) return res.status(400).json({ error: 'domain and query are required' });
 
-  const cleanDomain = domain.replace(/^https?:\/\//, '').split('/')[0].toLowerCase();
-  const cleanQuery  = String(query).slice(0, 200);
+  const cleanDomain  = domain.replace(/^https?:\/\//, '').split('/')[0].toLowerCase();
+  const cleanQuery   = String(query).slice(0, 200);
+  const cleanAgentId = agent_id ? String(agent_id).slice(0, 100) : null;
 
   try {
     const [matches, exists] = await Promise.all([
@@ -51,6 +52,7 @@ export default async function handler(req, res) {
 
     const task = await createTask({
       state,
+      agent_id:     cleanAgentId,
       query_domain: cleanDomain,
       query_text:   cleanQuery,
       task_url:     taskUrl,
