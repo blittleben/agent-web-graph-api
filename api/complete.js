@@ -25,14 +25,9 @@ function validateResult(result) {
   if (!url || typeof url !== 'string') return 'url required';
   try { new URL(url); } catch(e) { return 'url must be valid'; }
   if (!title || typeof title !== 'string') return 'title required';
-  if (!VALID_PAGE_TYPES.has(page_type)) return 'page_type must be one of: ' + [...VALID_PAGE_TYPES].join(',');
   if (!Array.isArray(breadcrumb)) return 'breadcrumb must be array';
   if (!Array.isArray(outbound_links)) return 'outbound_links must be array';
-  for (const link of outbound_links) {
-    if (!link.url || !link.anchor_text) return 'each link needs url and anchor_text';
-    if (link.link_type && !VALID_LINK_TYPES.has(link.link_type)) return 'invalid link_type: ' + link.link_type;
-    try { new URL(link.url); } catch(e) { return 'invalid link url: ' + link.url; }
-  }
+  if (page_type && !VALID_PAGE_TYPES.has(page_type)) return `page_type must be one of: ${[...VALID_PAGE_TYPES].join(', ')}`;
   return null;
 }
 
@@ -42,65 +37,103 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
   const { task_id, agent_id, result } = req.body || {};
-  if (!task_id || !agent_id || !result) {
-    return res.status(400).json({ error: 'task_id, agent_id, and result required' });
-  }
+  if (!task_id) return res.status(400).json({ error: 'task_id required' });
+  if (!result)  return res.status(400).json({ error: 'result required' });
 
   const validationError = validateResult(result);
   if (validationError) return res.status(400).json({ error: validationError });
 
-  const task = await getTask(task_id);
-  if (!task) return res.status(404).json({ error: 'task not found' });
-  if (task.agent_id !== agent_id) return res.status(403).json({ error: 'task not assigned to this agent' });
-  if (task.status !== 'pending') return res.status(409).json({ error: 'task already ' + task.status });
-
   const { url, title, page_type, breadcrumb, outbound_links } = result;
-  const domain = new URL(url).hostname;
 
-  // Store the crawled page
-  await upsertNodes([{
-    url, domain, title, page_type,
-    breadcrumb: breadcrumb || [],
-    trust_score: 0.1
-  }]);
+  // Fetch the task
+  let task;
+  try {
+    task = await getTask(task_id);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch task', detail: err.message });
+  }
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  if (task.status === 'completed') return res.status(409).json({ error: 'Task already completed' });
 
-  // Store outbound link structure
-  if (outbound_links.length > 0) {
-    const edges = outbound_links.map(link => ({
-      from_url: url,
-      to_url: link.url,
-      anchor_text: link.anchor_text,
-      link_type: link.link_type || 'inline_link'
-    }));
-    await upsertEdges(edges);
+  // agent_id check is optional — only enforce if task has one stored
+  if (task.agent_id && task.agent_id !== agent_id) {
+    return res.status(403).json({ error: 'task not assigned to this agent' });
+  }
 
-    // Feed discovered URLs back into the queue for future crawling
-    // Same domain gets medium priority (50), cross-domain gets low (30)
-    const queueItems = outbound_links
-      .slice(0, 25)
-      .map(link => {
+  // Derive domain from url
+  let domain;
+  try {
+    domain = new URL(url).hostname;
+  } catch (e) {
+    return res.status(400).json({ error: 'url must be a valid URL' });
+  }
+
+  // Sanitize breadcrumb
+  const cleanBreadcrumb = Array.isArray(breadcrumb)
+    ? breadcrumb.filter(b => typeof b === 'string').slice(0, 20)
+    : [];
+
+  // Sanitize outbound_links
+  const cleanLinks = Array.isArray(outbound_links)
+    ? outbound_links.filter(l => l && typeof l.url === 'string').slice(0, 200).map(l => ({
+        url: l.url,
+        anchor_text: typeof l.anchor_text === 'string' ? l.anchor_text.slice(0, 200) : '',
+        link_type: VALID_LINK_TYPES.has(l.link_type) ? l.link_type : 'inline_link',
+      }))
+    : [];
+
+  try {
+    // Upsert node
+    await upsertNodes([{
+      url,
+      domain,
+      title: title.slice(0, 500),
+      page_type: VALID_PAGE_TYPES.has(page_type) ? page_type : 'other',
+      breadcrumb: cleanBreadcrumb,
+      trust_score: 0.1,
+    }]);
+
+    // Upsert edges
+    if (cleanLinks.length > 0) {
+      const edges = cleanLinks.map(l => ({
+        source_url: url,
+        target_url: l.url,
+        anchor_text: l.anchor_text,
+        link_type: l.link_type,
+      }));
+      await upsertEdges(edges);
+
+      // Enqueue outbound links for future crawling (up to 25)
+      const queueItems = cleanLinks.slice(0, 25).map(link => {
         try {
           const u = new URL(link.url);
           const d = u.hostname;
           return { url: link.url, domain: d, priority: d === domain ? 50 : 30 };
         } catch { return null; }
-      })
-      .filter(Boolean);
-    enqueueUrls(queueItems).catch(() => {});
+      }).filter(Boolean);
+      enqueueUrls(queueItems).catch(() => {});
+    }
+
+    // Mark queue item as mapped using task_url
+    await markQueueItemMapped(task.task_url).catch(() => {});
+
+    // Complete the task
+    await completeTask(task_id);
+
+    // Return answer using stored query context
+    const answer = await searchNodes(task.query_domain, task.query_text);
+    const state = answer ? 'mapped' : 'partial';
+
+    return res.status(200).json({
+      ok: true,
+      state,
+      answer: answer || null,
+      message: state === 'mapped'
+        ? 'Contribution accepted and answer found'
+        : 'Contribution accepted, query still partial',
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal error', detail: err.message });
   }
-
-  // Mark the queue item done — use task_url (the URL this agent was asked to crawl)
-  await markQueueItemMapped(task.task_url).catch(() => {});
-  await completeTask(task_id);
-
-  // Return the answer to the agent's original query
-  const originalQuery = task.query_text;
-  const answer = await searchNodes(task.query_domain, originalQuery);
-
-  return res.status(200).json({
-    status: 'accepted',
-    answer: answer?.length
-      ? { type: 'mapped', data: answer[0] }
-      : { type: 'still_unmapped', message: 'result stored but original query remains unmapped' }
-  });
 }
