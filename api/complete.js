@@ -1,7 +1,8 @@
 import {
   getTask, completeTask,
   upsertNodes, upsertEdges,
-  markQueueItemMapped, searchNodes
+  markQueueItemMapped, searchNodes,
+  enqueueUrls
 } from './_db.js';
 
 const CORS = (res) => {
@@ -54,15 +55,16 @@ export default async function handler(req, res) {
   if (task.status !== 'pending') return res.status(409).json({ error: 'task already ' + task.status });
 
   const { url, title, page_type, breadcrumb, outbound_links } = result;
-  const targetUrl = new URL(url);
-  const domain = targetUrl.hostname;
+  const domain = new URL(url).hostname;
 
+  // Store the crawled page
   await upsertNodes([{
     url, domain, title, page_type,
     breadcrumb: breadcrumb || [],
     trust_score: 0.1
   }]);
 
+  // Store outbound link structure
   if (outbound_links.length > 0) {
     const edges = outbound_links.map(link => ({
       from_url: url,
@@ -71,16 +73,34 @@ export default async function handler(req, res) {
       link_type: link.link_type || 'inline_link'
     }));
     await upsertEdges(edges);
+
+    // Feed discovered URLs back into the queue for future crawling
+    // Same domain gets medium priority (50), cross-domain gets low (30)
+    const queueItems = outbound_links
+      .slice(0, 25)
+      .map(link => {
+        try {
+          const u = new URL(link.url);
+          const d = u.hostname;
+          return { url: link.url, domain: d, priority: d === domain ? 50 : 30 };
+        } catch { return null; }
+      })
+      .filter(Boolean);
+    enqueueUrls(queueItems).catch(() => {});
   }
 
+  // Mark the queue item done — use task_url (the URL this agent was asked to crawl)
+  await markQueueItemMapped(task.task_url).catch(() => {});
   await completeTask(task_id);
-  await markQueueItemMapped(task.queue_item_id);
 
-  const originalQuery = task.original_query;
-  const answer = await searchNodes(originalQuery.url || originalQuery.domain, originalQuery.path);
+  // Return the answer to the agent's original query
+  const originalQuery = task.query_text;
+  const answer = await searchNodes(task.query_domain, originalQuery);
 
   return res.status(200).json({
     status: 'accepted',
-    answer: answer || { type: 'still_unmapped', message: 'result stored but original query remains unmapped' }
+    answer: answer?.length
+      ? { type: 'mapped', data: answer[0] }
+      : { type: 'still_unmapped', message: 'result stored but original query remains unmapped' }
   });
 }
